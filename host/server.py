@@ -3,7 +3,7 @@ import os
 import subprocess
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HOST = "0.0.0.0"
@@ -266,12 +266,12 @@ def _run_gh_command():
         if not username:
             raise RuntimeError("missing GitHub username")
 
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
         month_payload = _fetch_usage_period(username, today.year, today.month)
         day_payload = _fetch_usage_period(username, today.year, today.month, today.day)
 
         extracted = _compute_summary(month_payload, day_payload, today)
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         extracted["updatedAt"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         extracted["error"] = None
         global _last_poll_at
@@ -281,7 +281,7 @@ def _run_gh_command():
         if DEBUG:
             print("updated:", extracted)
     except Exception as exc:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         error_payload = {
             "error": str(exc),
             "updatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -310,7 +310,7 @@ class Handler(BaseHTTPRequestHandler):
         with _cache_lock:
             payload = dict(_cache_payload)
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         payload = _apply_poll_schedule(payload, now, _last_poll_at)
 
         body = json.dumps(payload).encode("utf-8")
