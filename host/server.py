@@ -15,7 +15,7 @@ API_VERSION = "2022-11-28"
 GITHUB_USERNAME = None
 
 # Fallback when the API does not report a quota.
-DEFAULT_MONTHLY_QUOTA = 1500.0
+DEFAULT_MONTHLY_QUOTA = 300.0
 
 POLL_SECONDS = 900
 DEBUG = os.environ.get("COPILOT_USAGE_DEBUG", "").strip().lower() in {"1", "true", "yes"}
