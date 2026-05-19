@@ -3,13 +3,14 @@
 #include <WiFiClient.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include "secrets.h"
 
 // Wi-Fi
-static const char *WIFI_SSID = "SECRET_SSID";
-static const char *WIFI_PASS = "SECRET_PASSWORD";
+static const char *WIFI_SSID = SECRET_SSID;
+static const char *WIFI_PASS = SECRET_PASSWORD;
 
 // HTTP endpoint (host running server.py)
 static const char *USAGE_URL = "http://192.168.1.171:8732/copilot-usage";
@@ -91,25 +92,51 @@ static long serverCountdownSeconds() {
   return remaining;
 }
 
-static void drawTopRightCountdown() {
-  updateCountdownToggle();
-  long remaining = g_showServerCountdown ? serverCountdownSeconds() : deviceCountdownSeconds();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(88 + g_jitterX, 0 + g_jitterY);
-  display.print(g_showServerCountdown ? "S" : "D");
-  if (remaining < 0) {
-    display.print("--:--");
+static void drawCircleFillMeter(int cx, int cy, int r, float ratio) {
+  if (ratio < 0.0f) ratio = 0.0f;
+  if (ratio > 1.0f) ratio = 1.0f;
+
+  display.drawCircle(cx, cy, r, SSD1306_WHITE);
+
+  int fill_height = (int)roundf((float)(2 * r) * ratio);
+  if (fill_height <= 0) {
     return;
   }
 
-  int mins = (int)(remaining / 60);
-  int secs = (int)(remaining % 60);
-  if (mins < 10) display.print("0");
-  display.print(mins);
-  display.print(":");
-  if (secs < 10) display.print("0");
-  display.print(secs);
+  int y_bottom = cy + r;
+  int y_top = y_bottom - fill_height + 1;
+  if (y_top < cy - r) {
+    y_top = cy - r;
+  }
+
+  for (int y = y_bottom; y >= y_top; --y) {
+    int dy = y - cy;
+    int dx = (int)floorf(sqrtf((float)(r * r - dy * dy)));
+    display.drawFastHLine(cx - dx, y, 2 * dx + 1, SSD1306_WHITE);
+  }
+}
+
+static void drawTopRightIndicators() {
+  long device_remaining = deviceCountdownSeconds();
+  long server_remaining = serverCountdownSeconds();
+  float device_ratio = 0.0f;
+  float server_ratio = 0.0f;
+
+  if (device_remaining >= 0) {
+    float interval = (float)(POLL_INTERVAL_MS / 1000UL);
+    device_ratio = (interval - (float)device_remaining) / interval;
+  }
+  if (server_remaining >= 0 && g_usage.pollIntervalSec > 0) {
+    float interval = (float)g_usage.pollIntervalSec;
+    server_ratio = (interval - (float)server_remaining) / interval;
+  }
+
+  int r = 5;
+  int y = 5 + g_jitterY;
+  int x1 = 108 + g_jitterX;
+  int x2 = 120 + g_jitterX;
+  drawCircleFillMeter(x1, y, r, device_ratio);
+  drawCircleFillMeter(x2, y, r, server_ratio);
 }
 
 static void connectWiFi() {
@@ -194,7 +221,7 @@ static void renderDisplay() {
   display.setCursor(0 + g_jitterX, 0 + g_jitterY);
   display.print("Copilot Usage");
 
-  drawTopRightCountdown();
+  drawTopRightIndicators();
 
   if (!g_usage.hasData) {
     const char *status = "-";
