@@ -4,8 +4,10 @@ This project was created with the help of AI assistance. Some code and documenta
 
 ## Overview
 
-- Host runs a Python HTTP server that calls `gh api` and exposes `/copilot-usage` JSON.
-- ESP32 polls the endpoint and shows usage on an SSD1306 OLED.
+- Host runs a Python server that calls `gh api` and exposes `/copilot-usage` JSON.
+- Communication uses **WebSocket** (bidirectional): the server pushes updated data as soon as it fetches new GitHub Copilot usage.
+- An HTTP endpoint (`/copilot-usage`) remains available for compatibility.
+- ESP32 receives data in real time and shows usage on an SSD1306 OLED.
 
 ## Requirements
 
@@ -17,6 +19,7 @@ This project was created with the help of AI assistance. Some code and documenta
   - Adafruit SSD1306
   - Adafruit GFX
   - ArduinoJson (v6)
+  - WebSockets (by Markus Sattler / Links2004)
 
 ## Host Setup (Windows)
 
@@ -25,15 +28,19 @@ This project was created with the help of AI assistance. Some code and documenta
 gh auth status
 ```
 
-2) Start the HTTP server:
+2) Install the required Python package:
+```powershell
+pip install websockets>=12.0
+```
+
+3) Start the server:
 ```powershell
 python host\server.py
 ```
 
-3) Verify output in a browser:
-```
-http://<host-ip>:8732/copilot-usage
-```
+The server starts two endpoints:
+- **HTTP** `http://<host-ip>:8732/copilot-usage` (for browsers / curl)
+- **WebSocket** `ws://<host-ip>:8733` (for the ESP32)
 
 Optional debug logging:
 ```powershell
@@ -51,9 +58,10 @@ python host\server.py
 #define SECRET_PASSWORD "YOUR_WIFI_PASSWORD"
 ```
 
-3) Set the API endpoint in `firmware/CopilotUsageDisplay/CopilotUsageDisplay.ino`:
+3) Set the WebSocket host in `firmware/CopilotUsageDisplay/CopilotUsageDisplay.ino`:
 ```cpp
-static const char *USAGE_URL = "http://<host-ip>:8732/copilot-usage";
+static const char *WS_HOST = "<host-ip>";
+static const uint16_t WS_PORT = 8733;
 ```
 
 4) (Optional) Set I2C pins if your board needs them:
@@ -67,11 +75,14 @@ static const int I2C_SCL = 22;
 ## Notes
 
 - The display is configured for 128x32. If you have 128x64, update `SCREEN_HEIGHT`.
-- The device polls every 10 minutes (`POLL_INTERVAL_MS`).
+- The ESP32 connects via WebSocket to the server. Data is pushed automatically when the server refreshes (every 15 minutes by default). No polling needed.
+- The two small circles in the top-right corner indicate **WebSocket connection status** (left, filled = connected) and **server poll countdown** (right).
+- If the WebSocket disconnects, the ESP32 reconnects automatically every 5 seconds.
 - If you see resets with `Brownout detector was triggered`, use a stronger power supply and a short USB cable.
 - Keep real Wi-Fi credentials only in your local `secrets.h`; do not commit secrets.
 
 ## Files
 
-- `host/server.py` - Python HTTP server using `gh api`.
+- `host/server.py` - Python server (HTTP + WebSocket) using `gh api`.
+- `host/requirements.txt` - Python dependencies.
 - `firmware/CopilotUsageDisplay/CopilotUsageDisplay.ino` - ESP32 firmware.
