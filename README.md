@@ -45,26 +45,31 @@ python host\server.py
 
 1) Open `firmware/CopilotUsageDisplay/CopilotUsageDisplay.ino`.
 
-2) Set Wi-Fi and endpoint:
+2) Configure Wi-Fi credentials in `firmware/CopilotUsageDisplay/secrets.h`:
 ```cpp
-static const char *WIFI_SSID = "YOUR_WIFI_SSID";
-static const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
+#define SECRET_SSID "YOUR_WIFI_SSID"
+#define SECRET_PASSWORD "YOUR_WIFI_PASSWORD"
+```
+
+3) Set the API endpoint in `firmware/CopilotUsageDisplay/CopilotUsageDisplay.ino`:
+```cpp
 static const char *USAGE_URL = "http://<host-ip>:8732/copilot-usage";
 ```
 
-3) (Optional) Set I2C pins if your board needs them:
+4) (Optional) Set I2C pins if your board needs them:
 ```cpp
 static const int I2C_SDA = 21;
 static const int I2C_SCL = 22;
 ```
 
-4) Upload to the ESP32.
+5) Upload to the ESP32.
 
 ## Notes
 
 - The display is configured for 128x32. If you have 128x64, update `SCREEN_HEIGHT`.
 - The device polls every 10 minutes (`POLL_INTERVAL_MS`).
 - If you see resets with `Brownout detector was triggered`, use a stronger power supply and a short USB cable.
+- Keep real Wi-Fi credentials only in your local `secrets.h`; do not commit secrets.
 
 ## Files
 
