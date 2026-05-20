@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <HTTPClient.h>
+#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <math.h>
 #include <Adafruit_GFX.h>
@@ -12,11 +11,11 @@
 static const char *WIFI_SSID = SECRET_SSID;
 static const char *WIFI_PASS = SECRET_PASSWORD;
 
-// HTTP endpoint (host running server.py)
-static const char *USAGE_URL = "http://192.168.1.171:8732/copilot-usage";
+// WebSocket endpoint (host running server.py)
+static const char *WS_HOST = "192.168.1.171";
+static const uint16_t WS_PORT = 8733;
 
-// Polling
-static const unsigned long POLL_INTERVAL_MS = 5UL * 60UL * 1000UL;
+// Timing
 static const unsigned long BOOT_DELAY_MS = 3000UL;
 static const unsigned long DISPLAY_REFRESH_MS = 500UL;
 
@@ -45,14 +44,15 @@ struct UsageData {
   bool hasData;
 };
 
+WebSocketsClient webSocket;
+
+static bool g_wsConnected = false;
 static UsageData g_usage;
-static unsigned long g_lastPoll = 0;
+static unsigned long g_lastUpdate = 0;
 static unsigned long g_lastJitter = 0;
 static int g_jitterX = 0;
 static int g_jitterY = 0;
 static unsigned long g_lastDisplay = 0;
-static unsigned long g_lastCountdownToggle = 0;
-static bool g_showServerCountdown = false;
 
 static void updateJitter() {
   unsigned long now = millis();
@@ -63,30 +63,11 @@ static void updateJitter() {
   }
 }
 
-static void updateCountdownToggle() {
-  unsigned long now = millis();
-  if (g_lastCountdownToggle == 0 || now - g_lastCountdownToggle >= 3000) {
-    g_lastCountdownToggle = now;
-    g_showServerCountdown = !g_showServerCountdown;
-  }
-}
-
-static long deviceCountdownSeconds() {
-  if (g_lastPoll == 0) {
-    return -1;
-  }
-  long interval_sec = (long)(POLL_INTERVAL_MS / 1000UL);
-  long elapsed = (long)((millis() - g_lastPoll) / 1000UL);
-  long remaining = interval_sec - elapsed;
-  if (remaining < 0) remaining = 0;
-  return remaining;
-}
-
 static long serverCountdownSeconds() {
-  if (g_usage.pollInSec < 0 || g_lastPoll == 0) {
+  if (g_usage.pollInSec < 0 || g_lastUpdate == 0) {
     return -1;
   }
-  long elapsed = (long)((millis() - g_lastPoll) / 1000UL);
+  long elapsed = (long)((millis() - g_lastUpdate) / 1000UL);
   long remaining = g_usage.pollInSec - elapsed;
   if (remaining < 0) remaining = 0;
   return remaining;
@@ -117,15 +98,9 @@ static void drawCircleFillMeter(int cx, int cy, int r, float ratio) {
 }
 
 static void drawTopRightIndicators() {
-  long device_remaining = deviceCountdownSeconds();
   long server_remaining = serverCountdownSeconds();
-  float device_ratio = 0.0f;
   float server_ratio = 0.0f;
 
-  if (device_remaining >= 0) {
-    float interval = (float)(POLL_INTERVAL_MS / 1000UL);
-    device_ratio = (interval - (float)device_remaining) / interval;
-  }
   if (server_remaining >= 0 && g_usage.pollIntervalSec > 0) {
     float interval = (float)g_usage.pollIntervalSec;
     server_ratio = (interval - (float)server_remaining) / interval;
@@ -135,7 +110,7 @@ static void drawTopRightIndicators() {
   int y = 5 + g_jitterY;
   int x1 = 108 + g_jitterX;
   int x2 = 120 + g_jitterX;
-  drawCircleFillMeter(x1, y, r, device_ratio);
+  drawCircleFillMeter(x1, y, r, g_wsConnected ? 1.0f : 0.0f);
   drawCircleFillMeter(x2, y, r, server_ratio);
 }
 
@@ -178,30 +153,24 @@ static bool parseJsonPayload(const String &payload, UsageData &out) {
   return true;
 }
 
-static void fetchUsage() {
-  if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      g_wsConnected = false;
+      g_usage.error = "offline";
+      g_usage.hasData = false;
+      break;
+    case WStype_CONNECTED:
+      g_wsConnected = true;
+      break;
+    case WStype_TEXT:
+      g_wsConnected = true;
+      g_lastUpdate = millis();
+      parseJsonPayload(String((char *)payload), g_usage);
+      break;
+    default:
+      break;
   }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    g_usage.error = "offline";
-    g_usage.hasData = false;
-    return;
-  }
-
-  HTTPClient http;
-  http.setTimeout(7000);
-  http.begin(USAGE_URL);
-
-  int code = http.GET();
-  if (code == 200) {
-    String body = http.getString();
-    parseJsonPayload(body, g_usage);
-  } else {
-    g_usage.error = "http";
-    g_usage.hasData = false;
-  }
-  http.end();
 }
 
 static void drawProgressBar(int x, int y, int w, int h, float percent) {
@@ -323,17 +292,19 @@ void setup() {
   }
   display.display();
 
+  webSocket.begin(WS_HOST, WS_PORT, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocket.setReconnectInterval(5000);
+
   g_usage.hasData = false;
-  g_lastPoll = 0;
-  g_lastCountdownToggle = 0;
+  g_lastUpdate = 0;
+  g_wsConnected = false;
 }
 
 void loop() {
+  webSocket.loop();
+
   unsigned long now = millis();
-  if (g_lastPoll == 0 || now - g_lastPoll >= POLL_INTERVAL_MS) {
-    g_lastPoll = now;
-    fetchUsage();
-  }
   if (g_lastDisplay == 0 || now - g_lastDisplay >= DISPLAY_REFRESH_MS) {
     g_lastDisplay = now;
     renderDisplay();

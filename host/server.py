@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -6,8 +7,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import websockets
+
 HOST = "0.0.0.0"
 PORT = 8732
+WS_PORT = 8733
 
 API_VERSION = "2022-11-28"
 
@@ -35,6 +39,11 @@ _cache_payload = {
 }
 
 _last_poll_at = None
+
+# WebSocket broadcast state
+_ws_clients = set()
+_ws_clients_lock = threading.Lock()
+_ws_loop = None
 
 
 def _apply_poll_schedule(payload, now, last_poll_at):
@@ -258,6 +267,7 @@ def _compute_summary(month_payload, day_payload, today):
 def _update_cache(payload):
     with _cache_lock:
         _cache_payload.update(payload)
+    _broadcast_ws(payload)
 
 
 def _run_gh_command():
@@ -298,6 +308,60 @@ def _poll_loop():
         time.sleep(POLL_SECONDS)
 
 
+# WebSocket broadcast -------------------------------------------------
+
+def _broadcast_ws(payload):
+    with _ws_clients_lock:
+        if not _ws_clients:
+            return
+        clients = list(_ws_clients)
+        loop = _ws_loop
+    if loop is None:
+        return
+    message = json.dumps(payload)
+    asyncio.run_coroutine_threadsafe(
+        _ws_send_all(clients, message), loop
+    )
+
+async def _ws_send_all(clients, message):
+    await asyncio.gather(
+        *(c.send(message) for c in clients),
+        return_exceptions=True,
+    )
+
+async def _ws_handler(websocket):
+    global _ws_loop
+    if _ws_loop is None:
+        _ws_loop = asyncio.get_running_loop()
+    with _ws_clients_lock:
+        _ws_clients.add(websocket)
+    try:
+        with _cache_lock:
+            payload = dict(_cache_payload)
+        payload = _apply_poll_schedule(payload, datetime.now(timezone.utc), _last_poll_at)
+        await websocket.send(json.dumps(payload))
+        async for _ in websocket:
+            pass
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        with _ws_clients_lock:
+            _ws_clients.discard(websocket)
+
+def _run_ws_server():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    global _ws_loop
+    _ws_loop = loop
+    start_server = websockets.serve(
+        _ws_handler, HOST, WS_PORT,
+        ping_interval=30,
+        ping_timeout=10,
+    )
+    loop.run_until_complete(start_server)
+    loop.run_forever()
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if DEBUG:
@@ -327,8 +391,11 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     thread = threading.Thread(target=_poll_loop, daemon=True)
     thread.start()
+    ws_thread = threading.Thread(target=_run_ws_server, daemon=True)
+    ws_thread.start()
+    print("HTTP server on http://%s:%d/copilot-usage" % (HOST, PORT))
+    print("WebSocket server on ws://%s:%d" % (HOST, WS_PORT))
     server = HTTPServer((HOST, PORT), Handler)
-    print("Serving on http://%s:%d/copilot-usage" % (HOST, PORT))
     server.serve_forever()
 
 
