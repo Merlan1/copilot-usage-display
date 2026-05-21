@@ -5,6 +5,8 @@
 Slopped together by an AI after a brief discussion about wanting to see Copilot usage on a tiny screen. Almost none of this was written by a human. It mostly works, which is frankly surprising.
 
 ## Overview
+<img width="1446" height="1577" alt="grafik" src="https://github.com/user-attachments/assets/bdd1a67e-b035-4da8-8e9c-945dae4c86be" />
+
 
 - Host runs a Python server that calls `gh api` and exposes `/copilot-usage` JSON.
 - Communication uses **WebSocket** (bidirectional): the server pushes updated data as soon as it fetches new GitHub Copilot usage.
