@@ -1,24 +1,24 @@
 # Copilot Usage OLED (ESP32 + SSD1306)
 
-This project was created with the help of AI assistance. Some code and documentation were generated or modified with AI involvement.
-
 ## Overview
 
 - Host runs a Python server that calls `gh api` and exposes `/copilot-usage` JSON.
 - Communication uses **WebSocket** (bidirectional): the server pushes updated data as soon as it fetches new GitHub Copilot usage.
 - An HTTP endpoint (`/copilot-usage`) remains available for compatibility.
 - ESP32 receives data in real time and shows usage on an SSD1306 OLED.
+- A **physical button** (GPIO 0 / BOOT) triggers an immediate refresh.
+- Per-model breakdown is shown as a **smooth-scrolling info line** on the display.
 
 ## Requirements
 
 - Windows PC with GitHub CLI (`gh`) installed and authenticated.
 - Python 3.8+.
 - ESP32 board.
-- SSD1306 OLED (128x32 recommended based on the working example).
+- SSD1306 OLED (128x32 recommended).
 - Arduino IDE with libraries:
   - Adafruit SSD1306
   - Adafruit GFX
-  - ArduinoJson (v6)
+  - ArduinoJson (v7)
   - WebSockets (by Markus Sattler / Links2004)
 
 ## Host Setup (Windows)
@@ -72,11 +72,26 @@ static const int I2C_SCL = 22;
 
 5) Upload to the ESP32.
 
+## Display Layout
+
+```
+Copilot Usage               188/300
+[████████████████░░░░░░]   37.3%
+M:GPT-5.2-Codex 57.2%
+```
+
+- **Top row**: title (left) + remaining/limit quota (right).
+- **Middle row**: progress bar + usage percentage.
+- **Bottom row**: cycles through `avg/day` and per‑model percentages every 10 seconds with a smooth vertical slide animation.
+
+## Button
+
+Press the **BOOT button** (GPIO 0) on the ESP32 to send a `refresh` command to the host. The host immediately fetches fresh Copilot usage data from the GitHub API and pushes the update to all connected displays.
+
 ## Notes
 
 - The display is configured for 128x32. If you have 128x64, update `SCREEN_HEIGHT`.
-- The ESP32 connects via WebSocket to the server. Data is pushed automatically when the server refreshes (every 15 minutes by default). No polling needed.
-- The two small circles in the top-right corner indicate **WebSocket connection status** (left, filled = connected) and **server poll countdown** (right).
+- Data is pushed automatically when the server refreshes (every 15 minutes by default). No polling needed.
 - If the WebSocket disconnects, the ESP32 reconnects automatically every 5 seconds.
 - If you see resets with `Brownout detector was triggered`, use a stronger power supply and a short USB cable.
 - Keep real Wi-Fi credentials only in your local `secrets.h`; do not commit secrets.

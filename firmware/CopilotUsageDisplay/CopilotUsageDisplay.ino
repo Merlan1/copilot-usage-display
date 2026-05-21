@@ -15,9 +15,14 @@ static const char *WIFI_PASS = SECRET_PASSWORD;
 static const char *WS_HOST = "192.168.1.171";
 static const uint16_t WS_PORT = 8733;
 
+// Button (pulls LOW when pressed)
+static const uint8_t BTN_PIN = 0;
+static const unsigned long DEBOUNCE_MS = 50;
+static const unsigned long BUTTON_COOLDOWN_MS = 1000;
+
 // Timing
 static const unsigned long BOOT_DELAY_MS = 3000UL;
-static const unsigned long DISPLAY_REFRESH_MS = 500UL;
+static const unsigned long DISPLAY_REFRESH_MS = 30UL;
 
 // Display
 static const uint8_t SCREEN_WIDTH = 128;
@@ -44,6 +49,26 @@ struct UsageData {
   bool hasData;
 };
 
+// Model breakdown -----------------------------------------------------
+static const int MAX_MODELS = 6;
+struct ModelEntry {
+  String name;
+  float percent;
+};
+
+static int g_modelCount = 0;
+static ModelEntry g_models[MAX_MODELS];
+
+// Model cycling / smooth scroll
+static const unsigned long CYCLE_MS = 10000;
+static const unsigned long SCROLL_MS = 250;
+static int g_page = 0;           // 0=avg/day, 1..N=model
+static unsigned long g_lastPageSwitch = 0;
+static bool g_scrolling = false;
+static unsigned long g_scrollStart = 0;
+
+// ---------------------------------------------------------------------
+
 WebSocketsClient webSocket;
 
 static bool g_wsConnected = false;
@@ -53,6 +78,9 @@ static unsigned long g_lastJitter = 0;
 static int g_jitterX = 0;
 static int g_jitterY = 0;
 static unsigned long g_lastDisplay = 0;
+
+static unsigned long g_lastButtonPress = 0;
+static int g_lastButtonState = HIGH;
 
 static void updateJitter() {
   unsigned long now = millis();
@@ -124,8 +152,25 @@ static void connectWiFi() {
   }
 }
 
+static void parseModels(const JsonDocument &doc) {
+  g_modelCount = 0;
+  JsonArrayConst arr = doc["models"];
+  for (JsonVariantConst m : arr) {
+    if (g_modelCount >= MAX_MODELS) break;
+    const char *name = m["model"].as<const char *>();
+    g_models[g_modelCount].name = String(name ? name : "?");
+    g_models[g_modelCount].percent = m["percent"] | 0.0f;
+    g_modelCount++;
+  }
+  if (g_modelCount > 0) {
+    g_page = g_page % (g_modelCount + 1);
+  } else {
+    g_page = 0;
+  }
+}
+
 static bool parseJsonPayload(const String &payload, UsageData &out) {
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err) {
     out.error = "parse";
@@ -150,6 +195,7 @@ static bool parseJsonPayload(const String &payload, UsageData &out) {
   out.error = String(error_text ? error_text : "");
   out.hasData = isnan(out.remaining) == false && isnan(out.limit) == false;
 
+  parseModels(doc);
   return true;
 }
 
@@ -181,16 +227,37 @@ static void drawProgressBar(int x, int y, int w, int h, float percent) {
   display.fillRect(x + 1, y + 1, fill, h - 2, SSD1306_WHITE);
 }
 
+static void drawInfoLine(int page, int yOff) {
+  int y = 14 + g_jitterY + yOff;
+  display.setCursor(0 + g_jitterX, y);
+  if (page == 0) {
+    display.print("avg/day ");
+    if (!isnan(g_usage.avgDaily)) display.print(g_usage.avgDaily, 1);
+    else display.print("-");
+    display.print(" td ");
+    if (!isnan(g_usage.todayUsed)) display.print(g_usage.todayUsed, 0);
+    else display.print("-");
+  } else {
+    int idx = page - 1;
+    if (idx < g_modelCount) {
+      display.print("M:");
+      display.print(g_models[idx].name);
+      display.print(" ");
+      display.print(g_models[idx].percent, 1);
+      display.print("%");
+    }
+  }
+}
+
 static void renderDisplay() {
   updateJitter();
+  unsigned long now = millis();
   display.clearDisplay();
 
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(0 + g_jitterX, 0 + g_jitterY);
-  display.print("Copilot Usage");
-
-  drawTopRightIndicators();
+  display.print("Usage:");
 
   if (!g_usage.hasData) {
     const char *status = "-";
@@ -216,35 +283,51 @@ static void renderDisplay() {
     return;
   }
 
-  display.setTextSize(1);
-  display.setCursor(0 + g_jitterX, 8 + g_jitterY);
+  // Remaining/limit at top right
+  display.setCursor(75 + g_jitterX, 0 + g_jitterY);
   display.print((int)g_usage.remaining);
   display.print("/");
   display.print((int)g_usage.limit);
 
-  drawProgressBar(0 + g_jitterX, 18 + g_jitterY, 80, 6, g_usage.percent);
+  // Bottom cycling info line — drawn FIRST (may overlap progress bar area)
+  if (g_modelCount > 0) {
+    int totalPages = g_modelCount + 1;
+
+    if (!g_scrolling && g_lastPageSwitch > 0 && now - g_lastPageSwitch >= CYCLE_MS) {
+      g_scrolling = true;
+      g_scrollStart = now;
+    }
+
+    if (g_scrolling) {
+      unsigned long elapsed = now - g_scrollStart;
+      if (elapsed >= SCROLL_MS) {
+        g_scrolling = false;
+        g_page = (g_page + 1) % totalPages;
+        g_lastPageSwitch = now;
+        drawInfoLine(g_page, 0);
+      } else {
+        float p = (float)elapsed / (float)SCROLL_MS;
+        int off = (int)(p * 4);
+        drawInfoLine(g_page, -off);
+        drawInfoLine((g_page + 1) % totalPages, 4 - off);
+      }
+    } else {
+      if (g_lastPageSwitch == 0) g_lastPageSwitch = now;
+      drawInfoLine(g_page, 0);
+    }
+  } else {
+    drawInfoLine(0, 0);
+  }
+
+  // Progress bar + percent — drawn LAST (covers scrolled text in its area)
+  drawProgressBar(0 + g_jitterX, 8 + g_jitterY, 80, 6, g_usage.percent);
   display.setTextSize(1);
-  display.setCursor(86 + g_jitterX, 18 + g_jitterY);
+  display.setCursor(86 + g_jitterX, 8 + g_jitterY);
   if (!isnan(g_usage.percent)) {
     display.print(g_usage.percent, 1);
     display.print("%");
   } else {
     display.print("--");
-  }
-
-  display.setCursor(0 + g_jitterX, 24 + g_jitterY);
-  display.print("avg/day ");
-  if (!isnan(g_usage.avgDaily)) {
-    display.print(g_usage.avgDaily, 1);
-  } else {
-    display.print("-");
-  }
-
-  display.print(" td ");
-  if (!isnan(g_usage.todayUsed)) {
-    display.print(g_usage.todayUsed, 0);
-  } else {
-    display.print("-");
   }
 
   display.display();
@@ -276,6 +359,9 @@ void setup() {
 
   delay(BOOT_DELAY_MS);
 
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  g_lastButtonState = digitalRead(BTN_PIN);
+
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   connectWiFi();
@@ -299,10 +385,21 @@ void setup() {
   g_usage.hasData = false;
   g_lastUpdate = 0;
   g_wsConnected = false;
+  g_modelCount = 0;
+  g_page = 0;
+  g_lastPageSwitch = 0;
+  g_scrolling = false;
 }
 
 void loop() {
   webSocket.loop();
+
+  int buttonState = digitalRead(BTN_PIN);
+  if (buttonState == LOW && g_lastButtonState == HIGH && millis() - g_lastButtonPress >= BUTTON_COOLDOWN_MS) {
+    g_lastButtonPress = millis();
+    webSocket.sendTXT("refresh");
+  }
+  g_lastButtonState = buttonState;
 
   unsigned long now = millis();
   if (g_lastDisplay == 0 || now - g_lastDisplay >= DISPLAY_REFRESH_MS) {

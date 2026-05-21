@@ -238,6 +238,17 @@ def _compute_summary(month_payload, day_payload, today):
     mtd_used = sum(row["quantity"] for row in month_records)
     today_used = sum(row["quantity"] for row in day_records)
 
+    # Per-model breakdown
+    model_quantities = {}
+    for row in month_records:
+        name = row.get("model") or "unknown"
+        model_quantities[name] = model_quantities.get(name, 0) + row["quantity"]
+
+    models = []
+    for name, qty in sorted(model_quantities.items(), key=lambda x: -x[1]):
+        pct = round(qty / mtd_used * 100, 1) if mtd_used > 0 else 0
+        models.append({"model": name, "percent": pct})
+
     quota = None
     for row in month_records + day_records:
         candidate = row.get("total_monthly_quota")
@@ -261,6 +272,7 @@ def _compute_summary(month_payload, day_payload, today):
         "avgDaily": avg_daily,
         "resetAt": reset_at,
         "todayUsed": today_used,
+        "models": models,
     }
 
 
@@ -340,8 +352,11 @@ async def _ws_handler(websocket):
             payload = dict(_cache_payload)
         payload = _apply_poll_schedule(payload, datetime.now(timezone.utc), _last_poll_at)
         await websocket.send(json.dumps(payload))
-        async for _ in websocket:
-            pass
+        async for message in websocket:
+            if message == "refresh":
+                if DEBUG:
+                    print("refresh requested by client", websocket.remote_address)
+                threading.Thread(target=_run_gh_command, daemon=True).start()
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -353,13 +368,16 @@ def _run_ws_server():
     asyncio.set_event_loop(loop)
     global _ws_loop
     _ws_loop = loop
-    start_server = websockets.serve(
-        _ws_handler, HOST, WS_PORT,
-        ping_interval=30,
-        ping_timeout=10,
-    )
-    loop.run_until_complete(start_server)
-    loop.run_forever()
+
+    async def _start():
+        async with websockets.serve(
+            _ws_handler, HOST, WS_PORT,
+            ping_interval=30,
+            ping_timeout=10,
+        ):
+            await asyncio.Future()  # run forever
+
+    loop.run_until_complete(_start())
 
 
 class Handler(BaseHTTPRequestHandler):
