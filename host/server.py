@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import subprocess
@@ -7,11 +6,16 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import websockets
+import serial
+from serial.tools import list_ports
 
 HOST = "0.0.0.0"
 PORT = 8732
-WS_PORT = 8733
+
+# Optional USB serial output (e.g. "COM3"). Leave empty to disable.
+SERIAL_PORT = os.environ.get("COPILOT_USAGE_SERIAL_PORT", "").strip()
+SERIAL_BAUD = int(os.environ.get("COPILOT_USAGE_SERIAL_BAUD", "115200").strip() or 115200)
+SERIAL_ECHO = os.environ.get("COPILOT_USAGE_SERIAL_ECHO", "").strip().lower() in {"1", "true", "yes"}
 
 API_VERSION = "2022-11-28"
 
@@ -19,7 +23,7 @@ API_VERSION = "2022-11-28"
 GITHUB_USERNAME = None
 
 # Fallback when the API does not report a quota.
-DEFAULT_MONTHLY_QUOTA = 300.0
+DEFAULT_MONTHLY_QUOTA = float(os.environ.get("COPILOT_USAGE_MONTHLY_QUOTA", "300").strip() or 300.0)
 
 POLL_SECONDS = 900
 DEBUG = os.environ.get("COPILOT_USAGE_DEBUG", "").strip().lower() in {"1", "true", "yes"}
@@ -40,10 +44,9 @@ _cache_payload = {
 
 _last_poll_at = None
 
-# WebSocket broadcast state
-_ws_clients = set()
-_ws_clients_lock = threading.Lock()
-_ws_loop = None
+# Serial output state
+_serial_lock = threading.Lock()
+_serial_conn = None
 
 
 def _apply_poll_schedule(payload, now, last_poll_at):
@@ -131,6 +134,7 @@ def _parse_row(obj, fallback_date):
     quantity = _extract_number(
         obj,
         [
+            "discountQuantity",
             "grossQuantity",
             "quantity",
             "gross_quantity",
@@ -280,7 +284,24 @@ def _compute_summary(month_payload, day_payload, today):
 def _update_cache(payload):
     with _cache_lock:
         _cache_payload.update(payload)
-    _broadcast_ws(payload)
+    _write_serial(payload)
+
+
+def _write_serial(payload):
+    if not SERIAL_PORT:
+        return
+    message = json.dumps(payload)
+    data = (message + "\n").encode("utf-8")
+    with _serial_lock:
+        if _serial_conn is None:
+            return
+        try:
+            _serial_conn.write(data)
+            _serial_conn.flush()
+            if SERIAL_ECHO:
+                print("serial>", message)
+        except Exception:
+            pass
 
 
 def _run_gh_command():
@@ -321,64 +342,56 @@ def _poll_loop():
         time.sleep(POLL_SECONDS)
 
 
-# WebSocket broadcast -------------------------------------------------
-
-def _broadcast_ws(payload):
-    with _ws_clients_lock:
-        if not _ws_clients:
+def _serial_read_loop():
+    while True:
+        if not SERIAL_PORT:
             return
-        clients = list(_ws_clients)
-        loop = _ws_loop
-    if loop is None:
-        return
-    message = json.dumps(payload)
-    asyncio.run_coroutine_threadsafe(
-        _ws_send_all(clients, message), loop
-    )
-
-async def _ws_send_all(clients, message):
-    await asyncio.gather(
-        *(c.send(message) for c in clients),
-        return_exceptions=True,
-    )
-
-async def _ws_handler(websocket):
-    global _ws_loop
-    if _ws_loop is None:
-        _ws_loop = asyncio.get_running_loop()
-    with _ws_clients_lock:
-        _ws_clients.add(websocket)
-    try:
-        with _cache_lock:
-            payload = dict(_cache_payload)
-        payload = _apply_poll_schedule(payload, datetime.now(timezone.utc), _last_poll_at)
-        await websocket.send(json.dumps(payload))
-        async for message in websocket:
-            if message == "refresh":
+        try:
+            with _serial_lock:
+                ser = _serial_conn
+            if ser is None:
+                time.sleep(1)
+                continue
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            if line == "refresh":
                 if DEBUG:
-                    print("refresh requested by client", websocket.remote_address)
+                    print("refresh requested by serial client")
                 threading.Thread(target=_run_gh_command, daemon=True).start()
-    except websockets.exceptions.ConnectionClosed:
-        pass
-    finally:
-        with _ws_clients_lock:
-            _ws_clients.discard(websocket)
+            elif line == "ready":
+                if DEBUG:
+                    print("serial client ready")
+                with _cache_lock:
+                    payload = dict(_cache_payload)
+                payload = _apply_poll_schedule(payload, datetime.now(timezone.utc), _last_poll_at)
+                _write_serial(payload)
+        except Exception:
+            time.sleep(1)
 
-def _run_ws_server():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    global _ws_loop
-    _ws_loop = loop
 
-    async def _start():
-        async with websockets.serve(
-            _ws_handler, HOST, WS_PORT,
-            ping_interval=30,
-            ping_timeout=10,
-        ):
-            await asyncio.Future()  # run forever
-
-    loop.run_until_complete(_start())
+def _choose_serial_port():
+    ports = list(list_ports.comports())
+    if not ports:
+        return ""
+    print("Available serial ports:")
+    for idx, port in enumerate(ports, start=1):
+        label = "%d) %s" % (idx, port.device)
+        if port.description:
+            label += " - %s" % port.description
+        print(label)
+    print("0) Disable serial output")
+    while True:
+        choice = input("Select serial port [1-%d or 0]: " % len(ports)).strip()
+        if not choice:
+            continue
+        if choice == "0":
+            return ""
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(ports):
+                return ports[idx - 1].device
+        print("Invalid selection. Try again.")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -419,12 +432,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    global SERIAL_PORT
+    threading.Thread(target=_run_gh_command, daemon=True).start()
     thread = threading.Thread(target=_poll_loop, daemon=True)
     thread.start()
-    ws_thread = threading.Thread(target=_run_ws_server, daemon=True)
-    ws_thread.start()
+    if not SERIAL_PORT:
+        SERIAL_PORT = _choose_serial_port()
+    if SERIAL_PORT:
+        try:
+            global _serial_conn
+            _serial_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+            serial_thread = threading.Thread(target=_serial_read_loop, daemon=True)
+            serial_thread.start()
+            print("Serial output on %s @ %d" % (SERIAL_PORT, SERIAL_BAUD))
+        except Exception as exc:
+            print("Serial init failed:", exc)
     print("HTTP server on http://%s:%d/copilot-usage" % (HOST, PORT))
-    print("WebSocket server on ws://%s:%d" % (HOST, WS_PORT))
     server = HTTPServer((HOST, PORT), Handler)
     server.serve_forever()
 

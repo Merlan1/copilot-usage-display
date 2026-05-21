@@ -1,19 +1,8 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include "secrets.h"
-
-// Wi-Fi
-static const char *WIFI_SSID = SECRET_SSID;
-static const char *WIFI_PASS = SECRET_PASSWORD;
-
-// WebSocket endpoint (host running server.py)
-static const char *WS_HOST = "192.168.1.171";
-static const uint16_t WS_PORT = 8733;
 
 // Button (pulls LOW when pressed)
 static const uint8_t BTN_PIN = 0;
@@ -25,7 +14,7 @@ static const bool SHOW_REMAINING = false;  // true=remaining/total, false=used/t
 static const bool FLIP_DISPLAY = false;    // true=180° rotation
 
 // Timing
-static const unsigned long BOOT_DELAY_MS = 3000UL;
+static const unsigned long BOOT_DELAY_MS = 1000UL;
 static const unsigned long DISPLAY_REFRESH_MS = 30UL;
 
 // Display
@@ -79,9 +68,7 @@ static unsigned long g_scrollStart = 0;
 
 // ---------------------------------------------------------------------
 
-WebSocketsClient webSocket;
-
-static bool g_wsConnected = false;
+static bool g_serialConnected = false;
 static UsageData g_usage;
 static unsigned long g_lastUpdate = 0;
 static unsigned long g_lastJitter = 0;
@@ -91,6 +78,16 @@ static unsigned long g_lastDisplay = 0;
 
 static unsigned long g_lastButtonPress = 0;
 static int g_lastButtonState = HIGH;
+static String g_serialLine;
+static int g_braceDepth = 0;
+static bool g_inString = false;
+static bool g_escapeNext = false;
+static unsigned long g_rxBytes = 0;
+static bool g_seenBrace = false;
+static uint8_t g_lastByte = 0;
+static size_t g_lastBadLen = 0;
+static bool g_lastBadFraming = false;
+static String g_lastBadPrefix;
 
 static void updateJitter() {
   unsigned long now = millis();
@@ -98,67 +95,6 @@ static void updateJitter() {
     g_lastJitter = now;
     g_jitterX = (g_jitterX == 0) ? 1 : 0;
     g_jitterY = (g_jitterY == 0) ? 1 : 0;
-  }
-}
-
-static long serverCountdownSeconds() {
-  if (g_usage.pollInSec < 0 || g_lastUpdate == 0) {
-    return -1;
-  }
-  long elapsed = (long)((millis() - g_lastUpdate) / 1000UL);
-  long remaining = g_usage.pollInSec - elapsed;
-  if (remaining < 0) remaining = 0;
-  return remaining;
-}
-
-static void drawCircleFillMeter(int cx, int cy, int r, float ratio) {
-  if (ratio < 0.0f) ratio = 0.0f;
-  if (ratio > 1.0f) ratio = 1.0f;
-
-  display.drawCircle(cx, cy, r, SSD1306_WHITE);
-
-  int fill_height = (int)roundf((float)(2 * r) * ratio);
-  if (fill_height <= 0) {
-    return;
-  }
-
-  int y_bottom = cy + r;
-  int y_top = y_bottom - fill_height + 1;
-  if (y_top < cy - r) {
-    y_top = cy - r;
-  }
-
-  for (int y = y_bottom; y >= y_top; --y) {
-    int dy = y - cy;
-    int dx = (int)floorf(sqrtf((float)(r * r - dy * dy)));
-    display.drawFastHLine(cx - dx, y, 2 * dx + 1, SSD1306_WHITE);
-  }
-}
-
-static void drawTopRightIndicators() {
-  long server_remaining = serverCountdownSeconds();
-  float server_ratio = 0.0f;
-
-  if (server_remaining >= 0 && g_usage.pollIntervalSec > 0) {
-    float interval = (float)g_usage.pollIntervalSec;
-    server_ratio = (interval - (float)server_remaining) / interval;
-  }
-
-  int r = 5;
-  int y = 5 + g_jitterY;
-  int x1 = 108 + g_jitterX;
-  int x2 = 120 + g_jitterX;
-  drawCircleFillMeter(x1, y, r, g_wsConnected ? 1.0f : 0.0f);
-  drawCircleFillMeter(x2, y, r, server_ratio);
-}
-
-static void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(250);
   }
 }
 
@@ -180,11 +116,36 @@ static void parseModels(const JsonDocument &doc) {
 }
 
 static bool parseJsonPayload(const String &payload, UsageData &out) {
-  StaticJsonDocument<1024> doc;
-  DeserializationError err = deserializeJson(doc, payload);
+  g_lastBadLen = 0;
+  g_lastBadFraming = false;
+  g_lastBadPrefix = "";
+  String trimmed = payload;
+  trimmed.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    int first = trimmed.indexOf('{');
+    int last = trimmed.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+      trimmed = trimmed.substring(first, last + 1);
+    }
+  }
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+    out.error = "json";
+    out.hasData = false;
+    g_lastBadLen = payload.length();
+    g_lastBadFraming = true;
+    g_lastBadPrefix = trimmed.substring(0, 12);
+    return false;
+  }
+
+  size_t capacity = payload.length() * 2 + 1024;
+  if (capacity < 4096) capacity = 4096;
+  if (capacity > 16384) capacity = 16384;
+  DynamicJsonDocument doc(capacity);
+  DeserializationError err = deserializeJson(doc, trimmed);
   if (err) {
     out.error = "parse";
     out.hasData = false;
+    g_lastBadLen = trimmed.length();
     return false;
   }
 
@@ -209,23 +170,55 @@ static bool parseJsonPayload(const String &payload, UsageData &out) {
   return true;
 }
 
-static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      g_wsConnected = false;
-      g_usage.error = "offline";
-      g_usage.hasData = false;
-      break;
-    case WStype_CONNECTED:
-      g_wsConnected = true;
-      break;
-    case WStype_TEXT:
-      g_wsConnected = true;
-      g_lastUpdate = millis();
-      parseJsonPayload(String((char *)payload), g_usage);
-      break;
-    default:
-      break;
+static void pollSerial() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    g_rxBytes++;
+    g_lastByte = (uint8_t)c;
+    if (c == '{') {
+      g_seenBrace = true;
+    }
+    if (g_braceDepth == 0) {
+      if (c == '{') {
+        g_serialLine = "{";
+        g_braceDepth = 1;
+        g_inString = false;
+        g_escapeNext = false;
+      }
+      continue;
+    }
+
+    if (g_serialLine.length() < 16384) {
+      g_serialLine += c;
+    }
+
+    if (g_escapeNext) {
+      g_escapeNext = false;
+      continue;
+    }
+    if (g_inString && c == '\\') {
+      g_escapeNext = true;
+      continue;
+    }
+    if (c == '"') {
+      g_inString = !g_inString;
+      continue;
+    }
+    if (g_inString) {
+      continue;
+    }
+
+    if (c == '{') {
+      g_braceDepth++;
+    } else if (c == '}') {
+      g_braceDepth--;
+      if (g_braceDepth == 0) {
+        g_lastUpdate = millis();
+        g_serialConnected = true;
+        parseJsonPayload(g_serialLine, g_usage);
+        g_serialLine = "";
+      }
+    }
   }
 }
 
@@ -266,9 +259,6 @@ static void renderDisplay() {
 
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(0 + g_jitterX, TITLE_Y + g_jitterY);
-  display.print("Usage:");
-
   if (!g_usage.hasData) {
     const char *status = "-";
     String error = g_usage.error;
@@ -276,7 +266,7 @@ static void renderDisplay() {
     if (error.indexOf("http") >= 0) {
       status = "http";
     } else if (error.indexOf("offline") >= 0) {
-      status = "wifi";
+      status = "serial";
     } else if (error.indexOf("parse") >= 0) {
       status = "json";
     } else if (error.indexOf("auth") >= 0 || error.indexOf("401") >= 0) {
@@ -284,14 +274,36 @@ static void renderDisplay() {
     }
 
     display.setTextSize(1);
-    display.setCursor(0 + g_jitterX, ERR_Y + g_jitterY);
+    display.setCursor(0 + g_jitterX, 0 + g_jitterY);
     display.print("NO DATA");
     display.print(" (");
     display.print(status);
     display.print(")");
+    display.setCursor(0 + g_jitterX, 8 + g_jitterY);
+    if (g_lastUpdate == 0) {
+      if (g_rxBytes > 0) {
+        display.print("rx");
+        display.print((int)g_rxBytes);
+        display.print(" b");
+        if (g_lastByte < 16) display.print("0");
+        display.print(g_lastByte, HEX);
+        display.print(g_seenBrace ? " o1" : " o0");
+      } else {
+        display.print("waiting");
+      }
+    } else if (g_lastBadFraming) {
+      display.print("rx ");
+      display.print((int)g_lastBadLen);
+    } else {
+      display.print("bad json ");
+      display.print((int)g_lastBadLen);
+    }
     display.display();
     return;
   }
+
+  display.setCursor(0 + g_jitterX, TITLE_Y + g_jitterY);
+  display.print("Usage:");
 
   // Used/remaining at top right
   display.setCursor(75 + g_jitterX, TITLE_Y + g_jitterY);
@@ -381,29 +393,22 @@ void setup() {
   pinMode(BTN_PIN, INPUT_PULLUP);
   g_lastButtonState = digitalRead(BTN_PIN);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  connectWiFi();
+  Serial.setRxBufferSize(8192);
+  Serial.begin(115200);
+  Serial.println("ready");
+  delay(200);
 
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("Copilot Usage");
   display.setCursor(0, 16);
-  if (WiFi.status() == WL_CONNECTED) {
-    display.print("WiFi OK");
-  } else {
-    display.print("WiFi FAIL");
-  }
+  display.print("Serial OK");
   display.display();
-
-  webSocket.begin(WS_HOST, WS_PORT, "/");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
 
   g_usage.hasData = false;
   g_lastUpdate = 0;
-  g_wsConnected = false;
+  g_serialConnected = false;
   g_modelCount = 0;
   g_page = 0;
   g_lastPageSwitch = 0;
@@ -411,14 +416,18 @@ void setup() {
 }
 
 void loop() {
-  webSocket.loop();
+  pollSerial();
 
   int buttonState = digitalRead(BTN_PIN);
   if (buttonState == LOW && g_lastButtonState == HIGH && millis() - g_lastButtonPress >= BUTTON_COOLDOWN_MS) {
     g_lastButtonPress = millis();
-    webSocket.sendTXT("refresh");
+    Serial.println("refresh");
   }
   g_lastButtonState = buttonState;
+
+  if (g_lastUpdate == 0 && (millis() % 2000UL) < 30) {
+    Serial.println("ready");
+  }
 
   unsigned long now = millis();
   if (g_lastDisplay == 0 || now - g_lastDisplay >= DISPLAY_REFRESH_MS) {
