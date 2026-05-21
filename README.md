@@ -1,6 +1,6 @@
 # Copilot Usage OLED (ESP32 + SSD1306)
 
-##Disclaimer
+## Disclaimer
 
 Slopped together by an AI after a brief discussion about wanting to see Copilot usage on a tiny screen. Almost none of this was written by a human. It mostly works, which is frankly surprising.
 
