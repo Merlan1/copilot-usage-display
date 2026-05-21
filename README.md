@@ -46,6 +46,7 @@ python host\server.py
 
 The server starts two endpoints:
 - **HTTP** `http://<host-ip>:8732/copilot-usage` (for browsers / curl)
+- **HTTP** `http://<host-ip>:8732/refresh` (triggers an immediate `gh api` refresh)
 - **WebSocket** `ws://<host-ip>:8733` (for the ESP32)
 
 Optional debug logging:
