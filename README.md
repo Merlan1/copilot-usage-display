@@ -78,6 +78,18 @@ static const int I2C_SCL = 22;
 
 5) Upload to the ESP32.
 
+## Configuration
+
+Two compile-time toggles in `CopilotUsageDisplay.ino`:
+
+```cpp
+static const bool SHOW_REMAINING = true;   // true=remaining/total, false=used/total
+static const bool FLIP_DISPLAY   = false;  // true=180° rotation
+```
+
+- **SHOW_REMAINING**: Set to `true` to display `remaining / total` quota, or `false` to display `used / total`.
+- **FLIP_DISPLAY**: Set to `true` to rotate the image 180° (useful when the OLED is mounted upside-down).
+
 ## Display Layout
 
 ```

@@ -22,6 +22,7 @@ static const unsigned long BUTTON_COOLDOWN_MS = 1000;
 
 // Display mode
 static const bool SHOW_REMAINING = false;  // true=remaining/total, false=used/total
+static const bool FLIP_DISPLAY = false;    // true=180° rotation
 
 // Timing
 static const unsigned long BOOT_DELAY_MS = 3000UL;
@@ -354,6 +355,10 @@ void setup() {
     for (;;) {
       delay(1000);
     }
+  }
+
+  if (FLIP_DISPLAY) {
+    display.setRotation(2);
   }
 
   display.clearDisplay();
