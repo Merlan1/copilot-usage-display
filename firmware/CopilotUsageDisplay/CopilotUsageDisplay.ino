@@ -33,6 +33,12 @@ static const uint8_t SCREEN_WIDTH = 128;
 static const uint8_t SCREEN_HEIGHT = 32;
 static const int OLED_RESET = -1;
 static const uint8_t SCREEN_ADDRESS = 0x3c;
+// Layout offsets — scale with screen height so 32px and 64px both work
+static const int8_t TITLE_Y = 0;
+static const int8_t BAR_Y = SCREEN_HEIGHT / 4;       // 8 (32px) or 16 (64px)
+static const int8_t BAR_H = 6;
+static const int8_t INFO_Y = SCREEN_HEIGHT / 2;       // 16 (32px) or 32 (64px)
+static const int8_t ERR_Y = SCREEN_HEIGHT / 2;         // 16 (32px) or 32 (64px)
 // I2C pins (set to -1 to use board defaults)
 static const int I2C_SDA = -1;
 static const int I2C_SCL = -1;
@@ -232,7 +238,7 @@ static void drawProgressBar(int x, int y, int w, int h, float percent) {
 }
 
 static void drawInfoLine(int page, int yOff) {
-  int y = 16 + g_jitterY + yOff;
+  int y = INFO_Y + g_jitterY + yOff;
   display.setCursor(0 + g_jitterX, y);
   if (page == 0) {
     display.print("avg/day ");
@@ -260,7 +266,7 @@ static void renderDisplay() {
 
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
-  display.setCursor(0 + g_jitterX, 0 + g_jitterY);
+  display.setCursor(0 + g_jitterX, TITLE_Y + g_jitterY);
   display.print("Usage:");
 
   if (!g_usage.hasData) {
@@ -278,7 +284,7 @@ static void renderDisplay() {
     }
 
     display.setTextSize(1);
-    display.setCursor(0 + g_jitterX, 16 + g_jitterY);
+    display.setCursor(0 + g_jitterX, ERR_Y + g_jitterY);
     display.print("NO DATA");
     display.print(" (");
     display.print(status);
@@ -288,7 +294,7 @@ static void renderDisplay() {
   }
 
   // Used/remaining at top right
-  display.setCursor(75 + g_jitterX, 0 + g_jitterY);
+  display.setCursor(75 + g_jitterX, TITLE_Y + g_jitterY);
   if (SHOW_REMAINING) {
     display.print((int)g_usage.remaining);
   } else {
@@ -328,10 +334,10 @@ static void renderDisplay() {
   }
 
   // Progress bar + percent — erase bar area first to hide scrolled text
-  display.fillRect(0 + g_jitterX, 8 + g_jitterY, 128, 6, 0);
-  drawProgressBar(0 + g_jitterX, 8 + g_jitterY, 80, 6, g_usage.percent);
+  display.fillRect(0 + g_jitterX, BAR_Y + g_jitterY, 128, BAR_H, 0);
+  drawProgressBar(0 + g_jitterX, BAR_Y + g_jitterY, 80, BAR_H, g_usage.percent);
   display.setTextSize(1);
-  display.setCursor(86 + g_jitterX, 8 + g_jitterY);
+  display.setCursor(86 + g_jitterX, BAR_Y + g_jitterY);
   if (!isnan(g_usage.percent)) {
     display.print(g_usage.percent, 1);
     display.print("%");
