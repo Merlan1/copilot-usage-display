@@ -20,6 +20,9 @@ static const uint8_t BTN_PIN = 0;
 static const unsigned long DEBOUNCE_MS = 50;
 static const unsigned long BUTTON_COOLDOWN_MS = 1000;
 
+// Display mode
+static const bool SHOW_REMAINING = false;  // true=remaining/total, false=used/total
+
 // Timing
 static const unsigned long BOOT_DELAY_MS = 3000UL;
 static const unsigned long DISPLAY_REFRESH_MS = 30UL;
@@ -228,7 +231,7 @@ static void drawProgressBar(int x, int y, int w, int h, float percent) {
 }
 
 static void drawInfoLine(int page, int yOff) {
-  int y = 14 + g_jitterY + yOff;
+  int y = 16 + g_jitterY + yOff;
   display.setCursor(0 + g_jitterX, y);
   if (page == 0) {
     display.print("avg/day ");
@@ -283,13 +286,17 @@ static void renderDisplay() {
     return;
   }
 
-  // Remaining/limit at top right
+  // Used/remaining at top right
   display.setCursor(75 + g_jitterX, 0 + g_jitterY);
-  display.print((int)g_usage.remaining);
+  if (SHOW_REMAINING) {
+    display.print((int)g_usage.remaining);
+  } else {
+    display.print((int)(g_usage.limit - g_usage.remaining));
+  }
   display.print("/");
   display.print((int)g_usage.limit);
 
-  // Bottom cycling info line — drawn FIRST (may overlap progress bar area)
+  // Bottom cycling info line
   if (g_modelCount > 0) {
     int totalPages = g_modelCount + 1;
 
@@ -319,7 +326,8 @@ static void renderDisplay() {
     drawInfoLine(0, 0);
   }
 
-  // Progress bar + percent — drawn LAST (covers scrolled text in its area)
+  // Progress bar + percent — erase bar area first to hide scrolled text
+  display.fillRect(0 + g_jitterX, 8 + g_jitterY, 128, 6, 0);
   drawProgressBar(0 + g_jitterX, 8 + g_jitterY, 80, 6, g_usage.percent);
   display.setTextSize(1);
   display.setCursor(86 + g_jitterX, 8 + g_jitterY);
