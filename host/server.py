@@ -247,7 +247,8 @@ def _compute_summary(month_payload, day_payload, today):
     models = []
     for name, qty in sorted(model_quantities.items(), key=lambda x: -x[1]):
         pct = round(qty / mtd_used * 100, 1) if mtd_used > 0 else 0
-        models.append({"model": name, "percent": pct})
+        if pct > 0:
+            models.append({"model": name, "percent": pct})
 
     quota = None
     for row in month_records + day_records:
