@@ -137,10 +137,7 @@ static bool parseJsonPayload(const String &payload, UsageData &out) {
     return false;
   }
 
-  size_t capacity = payload.length() * 2 + 1024;
-  if (capacity < 4096) capacity = 4096;
-  if (capacity > 16384) capacity = 16384;
-  DynamicJsonDocument doc(capacity);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, trimmed);
   if (err) {
     out.error = "parse";
@@ -303,7 +300,11 @@ static void renderDisplay() {
   }
 
   display.setCursor(0 + g_jitterX, TITLE_Y + g_jitterY);
-  display.print("Usage:");
+  if (SHOW_REMAINING) {
+    display.print("Remaining:");
+  } else {
+    display.print("Used:");
+  }
 
   // Used/remaining at top right
   display.setCursor(75 + g_jitterX, TITLE_Y + g_jitterY);

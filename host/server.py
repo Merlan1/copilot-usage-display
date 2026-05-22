@@ -47,6 +47,7 @@ _last_poll_at = None
 # Serial output state
 _serial_lock = threading.Lock()
 _serial_conn = None
+_serial_reconnect_delay = 1.0
 
 
 def _apply_poll_schedule(payload, now, last_poll_at):
@@ -288,20 +289,69 @@ def _update_cache(payload):
 
 
 def _write_serial(payload):
+    global _serial_conn
     if not SERIAL_PORT:
         return
     message = json.dumps(payload)
     data = (message + "\n").encode("utf-8")
     with _serial_lock:
-        if _serial_conn is None:
+        ser = _serial_conn
+        if ser is None:
             return
         try:
-            _serial_conn.write(data)
-            _serial_conn.flush()
+            ser.write(data)
+            ser.flush()
             if SERIAL_ECHO:
                 print("serial>", message)
         except Exception:
-            pass
+            _serial_conn = None
+            try:
+                ser.close()
+            except Exception:
+                pass
+            if DEBUG:
+                print("serial write failed, connection closed")
+
+
+def _close_serial():
+    global _serial_conn
+    with _serial_lock:
+        if _serial_conn is not None:
+            try:
+                _serial_conn.close()
+            except Exception:
+                pass
+            _serial_conn = None
+    if DEBUG:
+        print("serial disconnected")
+
+
+def _ensure_serial():
+    """Returns True if connected, False if not (after backoff sleep)."""
+    global _serial_conn, _serial_reconnect_delay
+    with _serial_lock:
+        if _serial_conn is not None:
+            return True
+    if not SERIAL_PORT:
+        return False
+    try:
+        new_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+    except Exception as exc:
+        if DEBUG:
+            print("serial connect failed (%s), retry in %.0fs" % (exc, _serial_reconnect_delay))
+        time.sleep(_serial_reconnect_delay)
+        _serial_reconnect_delay = min(_serial_reconnect_delay * 2, 30.0)
+        return False
+    with _serial_lock:
+        _serial_conn = new_conn
+    _serial_reconnect_delay = 1.0
+    if DEBUG:
+        print("serial connected on %s @ %d" % (SERIAL_PORT, SERIAL_BAUD))
+    with _cache_lock:
+        payload = dict(_cache_payload)
+    payload = _apply_poll_schedule(payload, datetime.now(timezone.utc), _last_poll_at)
+    _write_serial(payload)
+    return True
 
 
 def _run_gh_command():
@@ -346,12 +396,11 @@ def _serial_read_loop():
     while True:
         if not SERIAL_PORT:
             return
+        if not _ensure_serial():
+            continue
+        with _serial_lock:
+            ser = _serial_conn
         try:
-            with _serial_lock:
-                ser = _serial_conn
-            if ser is None:
-                time.sleep(1)
-                continue
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             if not line:
                 continue
@@ -366,6 +415,10 @@ def _serial_read_loop():
                     payload = dict(_cache_payload)
                 payload = _apply_poll_schedule(payload, datetime.now(timezone.utc), _last_poll_at)
                 _write_serial(payload)
+        except serial.SerialException:
+            if DEBUG:
+                print("serial read failed, connection lost")
+            _close_serial()
         except Exception:
             time.sleep(1)
 
@@ -439,14 +492,9 @@ def main():
     if not SERIAL_PORT:
         SERIAL_PORT = _choose_serial_port()
     if SERIAL_PORT:
-        try:
-            global _serial_conn
-            _serial_conn = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-            serial_thread = threading.Thread(target=_serial_read_loop, daemon=True)
-            serial_thread.start()
-            print("Serial output on %s @ %d" % (SERIAL_PORT, SERIAL_BAUD))
-        except Exception as exc:
-            print("Serial init failed:", exc)
+        print("Serial output on %s @ %d" % (SERIAL_PORT, SERIAL_BAUD))
+        serial_thread = threading.Thread(target=_serial_read_loop, daemon=True)
+        serial_thread.start()
     print("HTTP server on http://%s:%d/copilot-usage" % (HOST, PORT))
     server = HTTPServer((HOST, PORT), Handler)
     server.serve_forever()
