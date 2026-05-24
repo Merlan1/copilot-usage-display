@@ -16,6 +16,7 @@ static const bool FLIP_DISPLAY = false;    // true=180° rotation
 // Timing
 static const unsigned long BOOT_DELAY_MS = 1000UL;
 static const unsigned long DISPLAY_REFRESH_MS = 30UL;
+static const unsigned long PAGE_SWITCH_MS = 30000UL;
 
 // Display
 static const uint8_t SCREEN_WIDTH = 128;
@@ -33,6 +34,16 @@ static const int I2C_SDA = -1;
 static const int I2C_SCL = -1;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+struct ClaudeData {
+  float fiveHour;
+  float sevenDay;
+  float sevenDaySonnet;
+  float sevenDayOpus;
+  long fiveHourResetsInSec;
+  long sevenDayResetsInSec;
+  bool hasData;
+};
+
 struct UsageData {
   float remaining;
   float limit;
@@ -46,6 +57,7 @@ struct UsageData {
   String nextPollAt;
   String error;
   bool hasData;
+  ClaudeData claude;
 };
 
 // Model breakdown -----------------------------------------------------
@@ -65,6 +77,10 @@ static int g_page = 0;           // 0=avg/day, 1..N=model
 static unsigned long g_lastPageSwitch = 0;
 static bool g_scrolling = false;
 static unsigned long g_scrollStart = 0;
+
+// Display page switching (0=Copilot, 1=Claude)
+static int g_displayPage = 0;
+static unsigned long g_lastDisplayPageSwitch = 0;
 
 // ---------------------------------------------------------------------
 
@@ -163,6 +179,23 @@ static bool parseJsonPayload(const String &payload, UsageData &out) {
   out.error = String(error_text ? error_text : "");
   out.hasData = isnan(out.remaining) == false && isnan(out.limit) == false;
 
+  // Claude Max usage
+  JsonVariantConst claude = doc["claude"];
+  if (!claude.isNull()) {
+    JsonVariantConst fh = claude["five_hour"];
+    if (!fh.isNull()) {
+      out.claude.fiveHour = fh["utilization"] | NAN;
+      out.claude.fiveHourResetsInSec = fh["resetsInSec"] | -1;
+      out.claude.sevenDay = claude["seven_day"]["utilization"] | NAN;
+      out.claude.sevenDayResetsInSec = claude["seven_day"]["resetsInSec"] | -1;
+      out.claude.sevenDaySonnet = claude["seven_day_sonnet"]["utilization"] | NAN;
+      out.claude.sevenDayOpus = claude["seven_day_opus"]["utilization"] | NAN;
+      out.claude.hasData = !isnan(out.claude.fiveHour);
+    }
+  } else {
+    out.claude.hasData = false;
+  }
+
   parseModels(doc);
   return true;
 }
@@ -227,7 +260,7 @@ static void drawProgressBar(int x, int y, int w, int h, float percent) {
   display.fillRect(x + 1, y + 1, fill, h - 2, SSD1306_WHITE);
 }
 
-static void drawInfoLine(int page, int yOff) {
+static void drawInfoLine(int page, int yOff, int claudePages) {
   int y = INFO_Y + g_jitterY + yOff;
   display.setCursor(0 + g_jitterX, y);
   if (page == 0) {
@@ -237,7 +270,7 @@ static void drawInfoLine(int page, int yOff) {
     display.print(" td ");
     if (!isnan(g_usage.todayUsed)) display.print(g_usage.todayUsed, 0);
     else display.print("-");
-  } else {
+  } else if (page <= g_modelCount) {
     int idx = page - 1;
     if (idx < g_modelCount) {
       display.print("M:");
@@ -246,10 +279,76 @@ static void drawInfoLine(int page, int yOff) {
       display.print(g_models[idx].percent, 1);
       display.print("%");
     }
+  } else if (claudePages > 0) {
+    display.print("Cl:");
+    if (!isnan(g_usage.claude.fiveHour)) {
+      display.print("5h ");
+      display.print((int)g_usage.claude.fiveHour);
+      display.print("%");
+    }
+    if (!isnan(g_usage.claude.sevenDay)) {
+      display.print(" 7d ");
+      display.print((int)g_usage.claude.sevenDay);
+      display.print("%");
+    }
   }
 }
 
-static void renderDisplay() {
+static void renderClaudeDisplay() {
+  updateJitter();
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0 + g_jitterX, 0 + g_jitterY);
+  display.print("Claude Usage");
+
+  int barX = 24;
+  int barW = 75;
+  int barH = 5;
+  int labelX = 0 + g_jitterX;
+  int pctX = 103 + g_jitterX;
+  int positions[] = {9, 18};
+
+  struct { const char *label; float value; } bars[2];
+  bars[0].label = "5h";
+  bars[0].value = g_usage.claude.fiveHour;
+  bars[1].label = "7d";
+  bars[1].value = g_usage.claude.sevenDay;
+
+  for (int i = 0; i < 2; i++) {
+    int y = positions[i] + g_jitterY;
+    display.setCursor(labelX, y);
+    display.print(bars[i].label);
+    drawProgressBar(barX + g_jitterX, y, barW, barH, bars[i].value);
+    display.setCursor(pctX, y);
+    if (!isnan(bars[i].value)) {
+      display.print((int)bars[i].value);
+      display.print("%");
+    } else {
+      display.print("--");
+    }
+  }
+
+  // Countdown line
+  display.setCursor(0 + g_jitterX, 24 + g_jitterY);
+  long secs = g_usage.claude.fiveHourResetsInSec;
+  if (secs > 0) {
+    int h = secs / 3600;
+    int m = (secs % 3600) / 60;
+    display.print("5h reset: ");
+    display.print(h);
+    display.print("h");
+    if (m < 10) display.print("0");
+    display.print(m);
+    display.print("m");
+  }
+
+  display.display();
+}
+
+
+static void renderCopilotDisplay() {
   updateJitter();
   unsigned long now = millis();
   display.clearDisplay();
@@ -317,9 +416,11 @@ static void renderDisplay() {
   display.print((int)g_usage.limit);
 
   // Bottom cycling info line
-  if (g_modelCount > 0) {
-    int totalPages = g_modelCount + 1;
+  int modelPages = g_modelCount > 0 ? g_modelCount : 0;
+  int claudePages = g_usage.claude.hasData ? 1 : 0;
+  int totalPages = 1 + modelPages + claudePages;
 
+  if (totalPages > 1) {
     if (!g_scrolling && g_lastPageSwitch > 0 && now - g_lastPageSwitch >= CYCLE_MS) {
       g_scrolling = true;
       g_scrollStart = now;
@@ -331,19 +432,19 @@ static void renderDisplay() {
         g_scrolling = false;
         g_page = (g_page + 1) % totalPages;
         g_lastPageSwitch = now;
-        drawInfoLine(g_page, 0);
+        drawInfoLine(g_page, 0, claudePages);
       } else {
         float p = (float)elapsed / (float)SCROLL_MS;
         int off = (int)(p * 4);
-        drawInfoLine(g_page, -off);
-        drawInfoLine((g_page + 1) % totalPages, 4 - off);
+        drawInfoLine(g_page, -off, claudePages);
+        drawInfoLine((g_page + 1) % totalPages, 4 - off, claudePages);
       }
     } else {
       if (g_lastPageSwitch == 0) g_lastPageSwitch = now;
-      drawInfoLine(g_page, 0);
+      drawInfoLine(g_page, 0, claudePages);
     }
   } else {
-    drawInfoLine(0, 0);
+    drawInfoLine(0, 0, claudePages);
   }
 
   // Progress bar + percent — erase bar area first to hide scrolled text
@@ -360,6 +461,31 @@ static void renderDisplay() {
 
   display.display();
 }
+
+
+static void renderDisplay() {
+  unsigned long now = millis();
+
+  if (g_usage.claude.hasData) {
+    if (g_lastDisplayPageSwitch == 0) {
+      g_lastDisplayPageSwitch = now;
+    }
+    if (now - g_lastDisplayPageSwitch >= PAGE_SWITCH_MS) {
+      g_lastDisplayPageSwitch = now;
+      g_displayPage = (g_displayPage + 1) % 2;
+    }
+  } else {
+    g_displayPage = 0;
+    g_lastDisplayPageSwitch = 0;
+  }
+
+  if (g_displayPage == 0) {
+    renderCopilotDisplay();
+  } else {
+    renderClaudeDisplay();
+  }
+}
+
 
 void setup() {
   if (I2C_SDA >= 0 && I2C_SCL >= 0) {
@@ -408,12 +534,21 @@ void setup() {
   display.display();
 
   g_usage.hasData = false;
+  g_usage.claude.hasData = false;
+  g_usage.claude.fiveHour = NAN;
+  g_usage.claude.sevenDay = NAN;
+  g_usage.claude.sevenDaySonnet = NAN;
+  g_usage.claude.sevenDayOpus = NAN;
+  g_usage.claude.fiveHourResetsInSec = -1;
+  g_usage.claude.sevenDayResetsInSec = -1;
   g_lastUpdate = 0;
   g_serialConnected = false;
   g_modelCount = 0;
   g_page = 0;
   g_lastPageSwitch = 0;
   g_scrolling = false;
+  g_displayPage = 0;
+  g_lastDisplayPageSwitch = 0;
 }
 
 void loop() {

@@ -3,6 +3,7 @@ import os
 import subprocess
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -28,6 +29,12 @@ DEFAULT_MONTHLY_QUOTA = float(os.environ.get("COPILOT_USAGE_MONTHLY_QUOTA", "300
 POLL_SECONDS = 900
 DEBUG = os.environ.get("COPILOT_USAGE_DEBUG", "").strip().lower() in {"1", "true", "yes"}
 
+# Claude Max usage tracking — auto-enabled when Claude Code credentials exist
+CLAUDE_CREDENTIALS_PATH = os.environ.get(
+    "CLAUDE_CREDENTIALS_PATH",
+    os.path.expanduser("~/.claude/.credentials.json"),
+)
+
 _cache_lock = threading.Lock()
 _cache_payload = {
     "remaining": None,
@@ -40,6 +47,7 @@ _cache_payload = {
     "pollInSec": None,
     "nextPollAt": None,
     "error": "no data yet",
+    "claude": None,
 }
 
 _last_poll_at = None
@@ -354,6 +362,61 @@ def _ensure_serial():
     return True
 
 
+def _fetch_claude_usage():
+    if not os.path.isfile(CLAUDE_CREDENTIALS_PATH):
+        return None
+    try:
+        with open(CLAUDE_CREDENTIALS_PATH) as f:
+            creds = json.load(f)
+        token = creds.get("claudeAiOauth", {}).get("accessToken")
+        if not token:
+            if DEBUG:
+                print("claude: no OAuth token in credentials")
+            return None
+        req = urllib.request.Request(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": "Bearer " + token,
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        now = datetime.now(timezone.utc)
+        result = {}
+        for key in ("five_hour", "seven_day", "seven_day_sonnet", "seven_day_opus"):
+            bucket = data.get(key)
+            if bucket is not None and bucket.get("utilization") is not None:
+                resets_at = bucket.get("resets_at")
+                resets_in_sec = None
+                if resets_at:
+                    try:
+                        reset_dt = datetime.fromisoformat(resets_at)
+                        delta = (reset_dt - now).total_seconds()
+                        resets_in_sec = max(0, int(delta))
+                    except Exception:
+                        pass
+                result[key] = {
+                    "utilization": bucket["utilization"],
+                    "resetsAt": resets_at,
+                    "resetsInSec": resets_in_sec,
+                }
+        extra = data.get("extra_usage")
+        if extra is not None:
+            result["extraUsage"] = {
+                "isEnabled": extra.get("is_enabled"),
+                "monthlyLimit": extra.get("monthly_limit"),
+                "usedCredits": extra.get("used_credits"),
+            }
+        if DEBUG:
+            print("claude:", json.dumps(result))
+        return result
+    except Exception as exc:
+        if DEBUG:
+            print("claude error:", exc)
+        return {"error": str(exc)}
+
+
 def _run_gh_command():
     try:
         username = _resolve_username()
@@ -365,6 +428,7 @@ def _run_gh_command():
         day_payload = _fetch_usage_period(username, today.year, today.month, today.day)
 
         extracted = _compute_summary(month_payload, day_payload, today)
+        extracted["claude"] = _fetch_claude_usage()
         now = datetime.now(timezone.utc)
         extracted["updatedAt"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         extracted["error"] = None
@@ -380,6 +444,7 @@ def _run_gh_command():
             "error": str(exc),
             "updatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        error_payload["claude"] = _fetch_claude_usage()
         error_payload = _apply_poll_schedule(error_payload, now, _last_poll_at)
         _update_cache(error_payload)
         if DEBUG:
