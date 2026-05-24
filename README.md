@@ -8,7 +8,7 @@ Slopped together by an AI after a brief discussion about wanting to see Copilot 
 
 - Host runs a Python server that calls `gh api` for Copilot usage and the Anthropic OAuth API for Claude Max usage.
 - Communication to the ESP32 uses **USB Serial** (one JSON payload per line).
-- An HTTP endpoint (`/copilot-usage`) remains available for compatibility.
+- An **HTTP dashboard** at `/` shows a live-rendered web page with usage bars and stats.
 - ESP32 receives data in real time and shows usage on an SSD1306 OLED.
 - A **physical button** (GPIO 0 / BOOT) triggers an immediate refresh.
 - Cycles between **Copilot** and **Claude Max** pages every 30 seconds.
@@ -41,9 +41,9 @@ pip install pyserial>=3.5
 python host\server.py
 ```
 
-The server starts two endpoints:
-- **HTTP** `http://<host-ip>:8732/copilot-usage` (for browsers / curl)
-- **HTTP** `http://<host-ip>:8732/refresh` (triggers an immediate `gh api` refresh)
+The server starts an HTTP server with two routes:
+- **`http://<host-ip>:8732/`** — Live dashboard: rendered HTML page with Copilot and Claude Max usage bars, per-model breakdown, and reset countdowns. Auto-refreshes every 30 seconds.
+- **`http://<host-ip>:8732/refresh`** — Triggers an immediate `gh api` poll and redirects back to the dashboard.
 
 Optional debug logging:
 ```powershell

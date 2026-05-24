@@ -512,6 +512,176 @@ def _choose_serial_port():
         print("Invalid selection. Try again.")
 
 
+def _fmt(value, decimals=1):
+    if value is None:
+        return "—"
+    return ("%." + str(decimals) + "f") % value
+
+
+def _fmt_int(value):
+    if value is None:
+        return "—"
+    return str(int(value))
+
+
+def _pct_bar(percent, width=260):
+    pct = max(0.0, min(100.0, percent or 0.0))
+    fill = int(width * pct / 100)
+    color = "#4caf50" if pct < 70 else "#ff9800" if pct < 90 else "#f44336"
+    return (
+        '<div style="background:#1e1e1e;border-radius:4px;height:18px;width:%dpx;overflow:hidden">'
+        '<div style="background:%s;height:100%%;width:%dpx;transition:width .3s"></div>'
+        "</div>" % (width, color, fill)
+    )
+
+
+def _time_until(iso_str):
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        delta = dt - datetime.now(timezone.utc)
+        total = int(delta.total_seconds())
+        if total <= 0:
+            return "now"
+        h, rem = divmod(total, 3600)
+        m = rem // 60
+        if h >= 24:
+            return "%dd %dh" % (h // 24, h % 24)
+        return "%dh %dm" % (h, m)
+    except Exception:
+        return None
+
+
+def _render_html(payload):
+    error = payload.get("error")
+    used = payload.get("remaining")
+    limit = payload.get("limit")
+    if used is not None and limit is not None:
+        used_val = limit - used
+    else:
+        used_val = None
+    percent = payload.get("percent")
+    avg = payload.get("avgDaily")
+    reset_at = payload.get("resetAt")
+    updated_at = payload.get("updatedAt")
+    poll_in = payload.get("pollInSec")
+    models = payload.get("models") or []
+    claude = payload.get("claude")
+
+    # -- Copilot section --
+    copilot_html = ""
+    if error and error != "no data yet":
+        copilot_html += '<p style="color:#f44336">Error: %s</p>' % error
+    else:
+        bar_html = _pct_bar(percent) if percent is not None else _pct_bar(0)
+        pct_label = ("%s%%" % _fmt(percent)) if percent is not None else "—"
+        copilot_html += (
+            '<div style="margin-bottom:8px">%s</div>'
+            '<div style="display:flex;gap:24px;margin-bottom:12px">'
+            '<span><b>Used:</b> %s / %s</span>'
+            '<span><b>%%:</b> %s</span>'
+            '<span><b>Avg/day:</b> %s</span>'
+            '<span><b>Resets:</b> %s</span>'
+            "</div>"
+        ) % (
+            bar_html,
+            _fmt_int(used_val),
+            _fmt_int(limit),
+            pct_label,
+            _fmt(avg),
+            _time_until(reset_at) or "—",
+        )
+        if models:
+            rows = "".join(
+                '<tr><td style="padding:2px 10px 2px 0">%s</td>'
+                '<td style="text-align:right">%s%%</td></tr>'
+                % (m.get("model", "unknown"), _fmt(m.get("percent")))
+                for m in models[:8]
+            )
+            copilot_html += "<table style='font-size:0.85em;border-collapse:collapse'>%s</table>" % rows
+
+    # -- Claude section --
+    claude_html = ""
+    if claude and not claude.get("error"):
+        def _bucket_row(label, bucket):
+            if not bucket:
+                return ""
+            util = bucket.get("utilization")
+            pct = util or 0
+            resets_in = bucket.get("resetsInSec")
+            countdown = ""
+            if resets_in is not None:
+                h, rem = divmod(resets_in, 3600)
+                m = rem // 60
+                countdown = " <span style='color:#888;font-size:0.85em'>(resets in %dh %dm)</span>" % (h, m)
+            return (
+                '<div style="margin-bottom:10px">'
+                '<div style="margin-bottom:4px"><b>%s:</b> %s%%%s</div>'
+                "%s"
+                "</div>"
+            ) % (label, _fmt(pct), countdown, _pct_bar(pct))
+
+        claude_html += _bucket_row("5-hour window", claude.get("five_hour"))
+        claude_html += _bucket_row("7-day window", claude.get("seven_day"))
+        claude_html += _bucket_row("7-day Sonnet", claude.get("seven_day_sonnet"))
+        claude_html += _bucket_row("7-day Opus", claude.get("seven_day_opus"))
+        extra = claude.get("extraUsage")
+        if extra and extra.get("isEnabled"):
+            monthly = extra.get("monthlyLimit")
+            credits = extra.get("usedCredits")
+            claude_html += (
+                '<p style="font-size:0.85em;color:#aaa">Extra usage: %s / %s credits</p>'
+                % (_fmt(credits), _fmt_int(monthly))
+            )
+    elif claude and claude.get("error"):
+        claude_html = '<p style="color:#f44336;font-size:0.85em">Claude error: %s</p>' % claude["error"]
+    else:
+        claude_html = '<p style="color:#888;font-size:0.85em">No Claude Max data</p>'
+
+    # -- Meta footer --
+    updated_label = updated_at or "never"
+    poll_label = ("%ds" % poll_in) if poll_in is not None else "—"
+
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Copilot Usage</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #121212; color: #e0e0e0; font-family: ui-monospace, monospace; font-size: 14px; padding: 24px; }}
+  h2 {{ font-size: 1em; text-transform: uppercase; letter-spacing: .08em; color: #888; margin-bottom: 12px; }}
+  section {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
+  a {{ color: #4fc3f7; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  footer {{ color: #555; font-size: 0.8em; margin-top: 8px; }}
+</style>
+</head>
+<body>
+<section>
+  <h2>GitHub Copilot</h2>
+  {copilot}
+</section>
+<section>
+  <h2>Claude Max</h2>
+  {claude}
+</section>
+<footer>
+  Updated: {updated} &nbsp;|&nbsp; Next poll: {poll} &nbsp;|&nbsp;
+  <a href="/refresh">Refresh now</a>
+</footer>
+</body>
+</html>""".format(
+        copilot=copilot_html,
+        claude=claude_html,
+        updated=updated_label,
+        poll=poll_label,
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if DEBUG:
@@ -519,15 +689,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/refresh":
             threading.Thread(target=_run_gh_command, daemon=True).start()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            body = b'{"status":"refreshing"}'
-            self.send_header("Content-Length", str(len(body)))
+            self.send_response(302)
+            self.send_header("Location", "/")
             self.end_headers()
-            self.wfile.write(body)
             return
 
-        if self.path != "/copilot-usage":
+        if self.path not in ("/", "/copilot-usage"):
             self.send_response(404)
             self.end_headers()
             return
@@ -538,9 +705,9 @@ class Handler(BaseHTTPRequestHandler):
         now = datetime.now(timezone.utc)
         payload = _apply_poll_schedule(payload, now, _last_poll_at)
 
-        body = json.dumps(payload).encode("utf-8")
+        body = _render_html(payload).encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -560,7 +727,7 @@ def main():
         print("Serial output on %s @ %d" % (SERIAL_PORT, SERIAL_BAUD))
         serial_thread = threading.Thread(target=_serial_read_loop, daemon=True)
         serial_thread.start()
-    print("HTTP server on http://%s:%d/copilot-usage" % (HOST, PORT))
+    print("HTTP server on http://%s:%d/" % (HOST, PORT))
     server = HTTPServer((HOST, PORT), Handler)
     server.serve_forever()
 
