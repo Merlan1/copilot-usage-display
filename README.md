@@ -99,8 +99,6 @@ firmware/
 └── lib/
 ```
 
-The original `CopilotUsageDisplay.ino` is also kept in `firmware/CopilotUsageDisplay/` for Arduino IDE users.
-
 ## Configuration
 
 Two compile-time toggles in `src/main.cpp`:
