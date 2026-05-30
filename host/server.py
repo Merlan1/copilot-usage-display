@@ -63,22 +63,11 @@ def _apply_poll_schedule(payload, now, last_poll_at):
     if last_poll_at is None:
         last_poll_at = now
     next_poll = last_poll_at + timedelta(seconds=poll_interval)
-    poll_in = int((next_poll - now).total_seconds())
-    if poll_in < 0:
-        poll_in = 0
+    poll_in = max(0, int((next_poll - now).total_seconds()))
     payload["pollIntervalSec"] = poll_interval
     payload["pollInSec"] = poll_in
     payload["nextPollAt"] = next_poll.strftime("%Y-%m-%dT%H:%M:%SZ")
     return payload
-
-
-def _coerce_number(value):
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _value_to_float(value):
@@ -251,7 +240,6 @@ def _compute_summary(month_payload, day_payload, today):
     mtd_used = sum(row["quantity"] for row in month_records)
     today_used = sum(row["quantity"] for row in day_records)
 
-    # Per-model breakdown
     model_quantities = {}
     for row in month_records:
         name = row.get("model") or "unknown"
@@ -418,37 +406,29 @@ def _fetch_claude_usage():
 
 
 def _run_gh_command():
+    now = datetime.now(timezone.utc)
+    claude_data = _fetch_claude_usage()
+    payload = {
+        "claude": claude_data,
+        "updatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     try:
         username = _resolve_username()
         if not username:
             raise RuntimeError("missing GitHub username")
-
-        today = datetime.now(timezone.utc).date()
-        month_payload = _fetch_usage_period(username, today.year, today.month)
-        day_payload = _fetch_usage_period(username, today.year, today.month, today.day)
-
-        extracted = _compute_summary(month_payload, day_payload, today)
-        extracted["claude"] = _fetch_claude_usage()
-        now = datetime.now(timezone.utc)
-        extracted["updatedAt"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        extracted["error"] = None
+        today = now.date()
+        month_data = _fetch_usage_period(username, today.year, today.month)
+        day_data = _fetch_usage_period(username, today.year, today.month, today.day)
+        payload.update(_compute_summary(month_data, day_data, today))
+        payload["error"] = None
         global _last_poll_at
         _last_poll_at = now
-        extracted = _apply_poll_schedule(extracted, now, _last_poll_at)
-        _update_cache(extracted)
-        if DEBUG:
-            print("updated:", extracted)
     except Exception as exc:
-        now = datetime.now(timezone.utc)
-        error_payload = {
-            "error": str(exc),
-            "updatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        error_payload["claude"] = _fetch_claude_usage()
-        error_payload = _apply_poll_schedule(error_payload, now, _last_poll_at)
-        _update_cache(error_payload)
-        if DEBUG:
-            print("error:", error_payload)
+        payload["error"] = str(exc)
+    payload = _apply_poll_schedule(payload, now, _last_poll_at)
+    _update_cache(payload)
+    if DEBUG:
+        print("updated:" if payload.get("error") is None else "error:", payload)
 
 
 def _poll_loop():
@@ -553,93 +533,92 @@ def _time_until(iso_str):
         return None
 
 
-def _render_html(payload):
+def _bucket_row(label, bucket):
+    if not bucket:
+        return ""
+    util = bucket.get("utilization")
+    pct = util or 0
+    resets_in = bucket.get("resetsInSec")
+    countdown = ""
+    if resets_in is not None:
+        h, rem = divmod(resets_in, 3600)
+        m = rem // 60
+        countdown = " <span style='color:#888;font-size:0.85em'>(resets in %dh %dm)</span>" % (h, m)
+    return (
+        '<div style="margin-bottom:10px">'
+        '<div style="margin-bottom:4px"><b>%s:</b> %s%%%s</div>'
+        "%s"
+        "</div>"
+    ) % (label, _fmt(pct), countdown, _pct_bar(pct))
+
+
+def _render_copilot_section(payload):
     error = payload.get("error")
-    used = payload.get("remaining")
+    if error and error != "no data yet":
+        return '<p style="color:#f44336">Error: %s</p>' % error
+
     limit = payload.get("limit")
-    if used is not None and limit is not None:
-        used_val = limit - used
-    else:
-        used_val = None
+    remaining = payload.get("remaining")
+    used_val = (limit - remaining) if (limit is not None and remaining is not None) else None
     percent = payload.get("percent")
     avg = payload.get("avgDaily")
     reset_at = payload.get("resetAt")
+    models = payload.get("models") or []
+
+    bar_html = _pct_bar(percent) if percent is not None else _pct_bar(0)
+    pct_label = ("%s%%" % _fmt(percent)) if percent is not None else "—"
+    html = (
+        '<div style="margin-bottom:8px">%s</div>'
+        '<div style="display:flex;gap:24px;margin-bottom:12px">'
+        '<span><b>Used:</b> %s / %s</span>'
+        '<span><b>%%:</b> %s</span>'
+        '<span><b>Avg/day:</b> %s</span>'
+        '<span><b>Resets:</b> %s</span>'
+        "</div>"
+    ) % (
+        bar_html,
+        _fmt_int(used_val),
+        _fmt_int(limit),
+        pct_label,
+        _fmt(avg),
+        _time_until(reset_at) or "—",
+    )
+    if models:
+        rows = "".join(
+            '<tr><td style="padding:2px 10px 2px 0">%s</td>'
+            '<td style="text-align:right">%s%%</td></tr>'
+            % (m.get("model", "unknown"), _fmt(m.get("percent")))
+            for m in models[:8]
+        )
+        html += "<table style='font-size:0.85em;border-collapse:collapse'>%s</table>" % rows
+    return html
+
+
+def _render_claude_section(claude):
+    if not claude:
+        return '<p style="color:#888;font-size:0.85em">No Claude Max data</p>'
+    if claude.get("error"):
+        return '<p style="color:#f44336;font-size:0.85em">Claude error: %s</p>' % claude["error"]
+
+    html = ""
+    html += _bucket_row("5-hour window", claude.get("five_hour"))
+    html += _bucket_row("7-day window", claude.get("seven_day"))
+    html += _bucket_row("7-day Sonnet", claude.get("seven_day_sonnet"))
+    html += _bucket_row("7-day Opus", claude.get("seven_day_opus"))
+    extra = claude.get("extraUsage")
+    if extra and extra.get("isEnabled"):
+        monthly = extra.get("monthlyLimit")
+        credits = extra.get("usedCredits")
+        html += (
+            '<p style="font-size:0.85em;color:#aaa">Extra usage: %s / %s credits</p>'
+            % (_fmt(credits), _fmt_int(monthly))
+        )
+    return html
+
+
+def _render_html(payload):
     updated_at = payload.get("updatedAt")
     poll_in = payload.get("pollInSec")
-    models = payload.get("models") or []
-    claude = payload.get("claude")
-
-    # -- Copilot section --
-    copilot_html = ""
-    if error and error != "no data yet":
-        copilot_html += '<p style="color:#f44336">Error: %s</p>' % error
-    else:
-        bar_html = _pct_bar(percent) if percent is not None else _pct_bar(0)
-        pct_label = ("%s%%" % _fmt(percent)) if percent is not None else "—"
-        copilot_html += (
-            '<div style="margin-bottom:8px">%s</div>'
-            '<div style="display:flex;gap:24px;margin-bottom:12px">'
-            '<span><b>Used:</b> %s / %s</span>'
-            '<span><b>%%:</b> %s</span>'
-            '<span><b>Avg/day:</b> %s</span>'
-            '<span><b>Resets:</b> %s</span>'
-            "</div>"
-        ) % (
-            bar_html,
-            _fmt_int(used_val),
-            _fmt_int(limit),
-            pct_label,
-            _fmt(avg),
-            _time_until(reset_at) or "—",
-        )
-        if models:
-            rows = "".join(
-                '<tr><td style="padding:2px 10px 2px 0">%s</td>'
-                '<td style="text-align:right">%s%%</td></tr>'
-                % (m.get("model", "unknown"), _fmt(m.get("percent")))
-                for m in models[:8]
-            )
-            copilot_html += "<table style='font-size:0.85em;border-collapse:collapse'>%s</table>" % rows
-
-    # -- Claude section --
-    claude_html = ""
-    if claude and not claude.get("error"):
-        def _bucket_row(label, bucket):
-            if not bucket:
-                return ""
-            util = bucket.get("utilization")
-            pct = util or 0
-            resets_in = bucket.get("resetsInSec")
-            countdown = ""
-            if resets_in is not None:
-                h, rem = divmod(resets_in, 3600)
-                m = rem // 60
-                countdown = " <span style='color:#888;font-size:0.85em'>(resets in %dh %dm)</span>" % (h, m)
-            return (
-                '<div style="margin-bottom:10px">'
-                '<div style="margin-bottom:4px"><b>%s:</b> %s%%%s</div>'
-                "%s"
-                "</div>"
-            ) % (label, _fmt(pct), countdown, _pct_bar(pct))
-
-        claude_html += _bucket_row("5-hour window", claude.get("five_hour"))
-        claude_html += _bucket_row("7-day window", claude.get("seven_day"))
-        claude_html += _bucket_row("7-day Sonnet", claude.get("seven_day_sonnet"))
-        claude_html += _bucket_row("7-day Opus", claude.get("seven_day_opus"))
-        extra = claude.get("extraUsage")
-        if extra and extra.get("isEnabled"):
-            monthly = extra.get("monthlyLimit")
-            credits = extra.get("usedCredits")
-            claude_html += (
-                '<p style="font-size:0.85em;color:#aaa">Extra usage: %s / %s credits</p>'
-                % (_fmt(credits), _fmt_int(monthly))
-            )
-    elif claude and claude.get("error"):
-        claude_html = '<p style="color:#f44336;font-size:0.85em">Claude error: %s</p>' % claude["error"]
-    else:
-        claude_html = '<p style="color:#888;font-size:0.85em">No Claude Max data</p>'
-
-    # -- Meta footer --
     updated_label = updated_at or "never"
     poll_label = ("%ds" % poll_in) if poll_in is not None else "—"
 
@@ -675,8 +654,8 @@ def _render_html(payload):
 </footer>
 </body>
 </html>""".format(
-        copilot=copilot_html,
-        claude=claude_html,
+        copilot=_render_copilot_section(payload),
+        claude=_render_claude_section(payload.get("claude")),
         updated=updated_label,
         poll=poll_label,
     )
